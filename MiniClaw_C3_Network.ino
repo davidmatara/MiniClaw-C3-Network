@@ -1,18 +1,21 @@
 /*
 ============================================================
-              MINICLAW ESP32-C3 NETWORK
-             FINAL COMPANION FIRMWARE
+              MINICLAW ESP32-C3
+          FINAL NETWORK + AUDIO NODE
 ============================================================
 
-FUNCTIONS
----------
-ESP-NOW
-Wi-Fi
-SIM800L / GSM / GPRS
-Wi-Fi -> GSM fallback
-INMP441 microphone
-Audio RMS monitoring
-Serial Monitor configuration
+RESPONSIBILITIES
+----------------
+- Wi-Fi scanning
+- Wi-Fi connection
+- Saved Wi-Fi credentials
+- GSM / SIM800L
+- Wi-Fi -> GSM fallback
+- ESP-NOW communication
+- INMP441 microphone
+- Network status
+- Microphone level
+- Commands from S3
 
 ============================================================
 PIN MAP
@@ -29,7 +32,7 @@ SD/DOUT  -> GPIO 5
 L/R      -> GND
 
 ============================================================
-SERIAL
+SERIAL MONITOR
 ============================================================
 
 115200 baud
@@ -39,6 +42,8 @@ COMMANDS
 HELP
 STATUS
 WIFI SCAN
+WIFI SSID <name>
+WIFI PASSWORD <password>
 WIFI CONNECT
 GSM STATUS
 GSM APN <apn>
@@ -79,7 +84,7 @@ HardwareSerial SIM800(1);
 #define MIC_SD 5
 
 #define MIC_SAMPLE_RATE 16000
-#define MIC_BUFFER_SAMPLES 512
+#define MIC_BUFFER_SAMPLES 256
 
 int32_t micBuffer[MIC_BUFFER_SAMPLES];
 
@@ -93,41 +98,86 @@ bool microphoneOK = false;
 
 Preferences prefs;
 
+String wifiSSID;
+String wifiPassword;
+String gsmAPN;
+
 // ============================================================
-// NETWORK
+// NETWORK STATE
 // ============================================================
 
 enum NetworkType
 {
-  NET_NONE,
-  NET_WIFI,
-  NET_GSM
+  NETWORK_NONE,
+  NETWORK_WIFI,
+  NETWORK_GSM
 };
 
-NetworkType activeNetwork = NET_NONE;
+NetworkType activeNetwork = NETWORK_NONE;
 
 bool wifiOK = false;
 bool gsmOK = false;
 
-String wifiSSID = "";
-String wifiPassword = "";
-String gsmAPN = "";
+// ============================================================
+// TIMERS
+// ============================================================
 
 unsigned long lastNetworkCheck = 0;
-unsigned long lastStatusSend = 0;
-unsigned long lastMicPrint = 0;
+unsigned long lastMicCheck = 0;
+unsigned long lastStatus = 0;
 
 // ============================================================
-// ESP-NOW
+// ESP-NOW PROTOCOL
 // ============================================================
 
-typedef struct
+#define ESPNOW_MAGIC 0x4D43
+#define ESPNOW_VERSION 1
+
+enum MessageType
 {
-  char command[160];
-} EspNowMessage;
+  MSG_PING = 1,
+  MSG_PONG,
 
-EspNowMessage outgoing;
-EspNowMessage incoming;
+  MSG_STATUS_REQUEST,
+  MSG_STATUS_RESPONSE,
+
+  MSG_WIFI_SCAN,
+  MSG_WIFI_SCAN_RESULT,
+
+  MSG_WIFI_CONNECT,
+  MSG_WIFI_CONNECTED,
+  MSG_WIFI_FAILED,
+
+  MSG_GSM_STATUS,
+  MSG_GSM_CONNECT,
+  MSG_GSM_CONNECTED,
+  MSG_GSM_FAILED,
+
+  MSG_NETWORK_STATUS,
+
+  MSG_MIC_STATUS,
+  MSG_MIC_LEVEL,
+
+  MSG_AUDIO_REQUEST,
+  MSG_AUDIO_DATA,
+
+  MSG_TEXT
+};
+
+struct MiniClawPacket
+{
+  uint16_t magic;
+  uint8_t version;
+  uint8_t type;
+  uint16_t sequence;
+  uint16_t length;
+  char data[220];
+};
+
+MiniClawPacket txPacket;
+MiniClawPacket rxPacket;
+
+uint16_t packetSequence = 0;
 
 uint8_t broadcastAddress[] =
 {
@@ -139,33 +189,61 @@ uint8_t broadcastAddress[] =
   0xFF
 };
 
-// Forward declaration
-void processCommand(String command);
-
 // ============================================================
 // ESP-NOW SEND
 // ============================================================
 
-void sendESPNow(
-  String message
+void sendPacket(
+  uint8_t type,
+  const String &data
 )
 {
   memset(
-    &outgoing,
+    &txPacket,
     0,
-    sizeof(outgoing)
+    sizeof(txPacket)
   );
 
-  message.toCharArray(
-    outgoing.command,
-    sizeof(outgoing.command)
+  txPacket.magic =
+    ESPNOW_MAGIC;
+
+  txPacket.version =
+    ESPNOW_VERSION;
+
+  txPacket.type =
+    type;
+
+  txPacket.sequence =
+    packetSequence++;
+
+  String limitedData =
+    data;
+
+  if (
+    limitedData.length() >
+    sizeof(txPacket.data) - 1
+  )
+  {
+    limitedData =
+      limitedData.substring(
+        0,
+        sizeof(txPacket.data) - 1
+      );
+  }
+
+  txPacket.length =
+    limitedData.length();
+
+  limitedData.toCharArray(
+    txPacket.data,
+    sizeof(txPacket.data)
   );
 
   esp_err_t result =
     esp_now_send(
       broadcastAddress,
-      (uint8_t *)&outgoing,
-      sizeof(outgoing)
+      (uint8_t *)&txPacket,
+      sizeof(txPacket)
     );
 
   if (
@@ -177,7 +255,7 @@ void sendESPNow(
     );
 
     Serial.println(
-      result
+      esp_err_to_name(result)
     );
   }
 }
@@ -193,46 +271,138 @@ void onDataReceive(
 )
 {
   if (
-    len <= 0
+    len != sizeof(MiniClawPacket)
   )
+  {
     return;
-
-  memset(
-    &incoming,
-    0,
-    sizeof(incoming)
-  );
-
-  int copyLength =
-    min(
-      len,
-      (int)sizeof(incoming)
-    );
+  }
 
   memcpy(
-    &incoming,
+    &rxPacket,
     data,
-    copyLength
+    sizeof(rxPacket)
   );
+
+  if (
+    rxPacket.magic !=
+    ESPNOW_MAGIC
+  )
+  {
+    return;
+  }
+
+  if (
+    rxPacket.version !=
+    ESPNOW_VERSION
+  )
+  {
+    return;
+  }
 
   String command =
     String(
-      incoming.command
+      rxPacket.data
     );
 
   command.trim();
 
   Serial.print(
-    "[ESP-NOW] S3 -> C3: "
+    "[ESP-NOW] RX type="
+  );
+
+  Serial.print(
+    rxPacket.type
+  );
+
+  Serial.print(
+    " data="
   );
 
   Serial.println(
     command
   );
 
-  processCommand(
-    command
-  );
+  switch (
+    rxPacket.type
+  )
+  {
+    case MSG_PING:
+
+      sendPacket(
+        MSG_PONG,
+        "C3_PONG"
+      );
+
+      break;
+
+    case MSG_STATUS_REQUEST:
+
+      sendStatusPacket();
+
+      break;
+
+    case MSG_WIFI_SCAN:
+
+      scanWiFi();
+
+      break;
+
+    case MSG_WIFI_CONNECT:
+
+      connectWiFi();
+
+      break;
+
+    case MSG_GSM_STATUS:
+
+      gsmStatus();
+
+      break;
+
+    case MSG_GSM_CONNECT:
+
+      connectGSM();
+
+      break;
+
+    case MSG_NETWORK_STATUS:
+
+      sendNetworkStatus();
+
+      break;
+
+    case MSG_MIC_STATUS:
+
+      sendMicStatus();
+
+      break;
+
+    case MSG_AUDIO_REQUEST:
+
+      sendMicLevel();
+
+      break;
+
+    case MSG_TEXT:
+
+      Serial.print(
+        "[S3] "
+      );
+
+      Serial.println(
+        command
+      );
+
+      break;
+
+    default:
+
+      Serial.println(
+        "[ESP-NOW] Unknown message"
+      );
+
+      break;
+  }
 }
 
 // ============================================================
@@ -254,7 +424,7 @@ bool initESPNow()
   )
   {
     Serial.println(
-      "[ESP-NOW] FAILED"
+      "[ESP-NOW] INIT FAILED"
     );
 
     return false;
@@ -282,7 +452,7 @@ bool initESPNow()
   )
   {
     Serial.println(
-      "[ESP-NOW] Peer setup failed"
+      "[ESP-NOW] PEER FAILED"
     );
 
     return false;
@@ -292,7 +462,8 @@ bool initESPNow()
     "[ESP-NOW] READY"
   );
 
-  sendESPNow(
+  sendPacket(
+    MSG_TEXT,
     "C3_READY"
   );
 
@@ -424,7 +595,7 @@ bool initMicrophone()
 }
 
 // ============================================================
-// MICROPHONE RMS
+// MICROPHONE READ
 // ============================================================
 
 float readMicrophone()
@@ -432,7 +603,9 @@ float readMicrophone()
   if (
     !microphoneOK
   )
+  {
     return 0;
+  }
 
   micBytesRead = 0;
 
@@ -442,7 +615,7 @@ float readMicrophone()
       micBuffer,
       sizeof(micBuffer),
       &micBytesRead,
-      pdMS_TO_TICKS(100)
+      pdMS_TO_TICKS(50)
     );
 
   if (
@@ -460,7 +633,9 @@ float readMicrophone()
   if (
     count <= 0
   )
+  {
     return 0;
+  }
 
   double sum = 0;
 
@@ -489,40 +664,49 @@ float readMicrophone()
 // MICROPHONE STATUS
 // ============================================================
 
-void printMicrophone()
+void sendMicStatus()
 {
   if (
-    !microphoneOK
+    microphoneOK
   )
   {
-    Serial.println(
-      "[MIC] NOT AVAILABLE"
+    sendPacket(
+      MSG_MIC_STATUS,
+      "MIC_READY"
     );
-
-    return;
   }
+  else
+  {
+    sendPacket(
+      MSG_MIC_STATUS,
+      "MIC_ERROR"
+    );
+  }
+}
 
+void sendMicLevel()
+{
   float rms =
     readMicrophone();
 
-  Serial.print(
-    "[MIC] RMS = "
-  );
-
-  Serial.println(
-    rms,
-    0
-  );
-
-  String message =
-    "MIC RMS=" +
+  String data =
+    "RMS=" +
     String(
       rms,
       0
     );
 
-  sendESPNow(
-    message
+  sendPacket(
+    MSG_MIC_LEVEL,
+    data
+  );
+
+  Serial.print(
+    "[MIC] "
+  );
+
+  Serial.println(
+    data
   );
 }
 
@@ -554,6 +738,10 @@ void loadConfiguration()
       "apn",
       ""
     );
+
+  Serial.println(
+    "[CONFIG] Loaded"
+  );
 }
 
 void saveConfiguration()
@@ -594,7 +782,10 @@ void scanWiFi()
   );
 
   int count =
-    WiFi.scanNetworks();
+    WiFi.scanNetworks(
+      false,
+      true
+    );
 
   if (
     count <= 0
@@ -602,6 +793,11 @@ void scanWiFi()
   {
     Serial.println(
       "No networks found."
+    );
+
+    sendPacket(
+      MSG_WIFI_SCAN_RESULT,
+      "COUNT=0"
     );
 
     return;
@@ -613,30 +809,32 @@ void scanWiFi()
     i++
   )
   {
-    Serial.print(
-      i
-    );
-
-    Serial.print(
-      ": "
-    );
-
-    Serial.print(
-      WiFi.SSID(i)
-    );
-
-    Serial.print(
-      " RSSI="
-    );
+    String result =
+      String(i) +
+      "|" +
+      WiFi.SSID(i) +
+      "|" +
+      String(
+        WiFi.RSSI(i)
+      );
 
     Serial.println(
-      WiFi.RSSI(i)
+      result
     );
+
+    sendPacket(
+      MSG_WIFI_SCAN_RESULT,
+      result
+    );
+
+    delay(20);
   }
 
   Serial.println(
     "=============================="
   );
+
+  WiFi.scanDelete();
 }
 
 // ============================================================
@@ -650,7 +848,7 @@ bool connectWiFi()
   )
   {
     Serial.println(
-      "[WIFI] No SSID configured"
+      "[WIFI] SSID not configured"
     );
 
     return false;
@@ -677,8 +875,10 @@ bool connectWiFi()
     millis();
 
   while (
-    WiFi.status() != WL_CONNECTED &&
-    millis() - start < 15000
+    WiFi.status() !=
+      WL_CONNECTED &&
+    millis() - start <
+      15000
   )
   {
     delay(500);
@@ -698,7 +898,7 @@ bool connectWiFi()
     wifiOK = true;
 
     activeNetwork =
-      NET_WIFI;
+      NETWORK_WIFI;
 
     Serial.println(
       "[WIFI] CONNECTED"
@@ -712,8 +912,9 @@ bool connectWiFi()
       WiFi.localIP()
     );
 
-    sendESPNow(
-      "WIFI_CONNECTED"
+    sendPacket(
+      MSG_WIFI_CONNECTED,
+      WiFi.localIP().toString()
     );
 
     return true;
@@ -725,7 +926,8 @@ bool connectWiFi()
     "[WIFI] FAILED"
   );
 
-  sendESPNow(
+  sendPacket(
+    MSG_WIFI_FAILED,
     "WIFI_FAILED"
   );
 
@@ -733,7 +935,7 @@ bool connectWiFi()
 }
 
 // ============================================================
-// SIM800L COMMAND
+// SIM800 COMMAND
 // ============================================================
 
 bool simCommand(
@@ -753,7 +955,7 @@ bool simCommand(
     command
   );
 
-  String response = "";
+  String response;
 
   unsigned long start =
     millis();
@@ -796,18 +998,30 @@ bool simCommand(
 
 void gsmStatus()
 {
-  Serial.println();
   Serial.println(
-    "========== GSM STATUS =========="
+    "[GSM] STATUS"
   );
 
-  simCommand(
-    "AT",
-    "OK",
-    2000
-  );
+  bool modem =
+    simCommand(
+      "AT",
+      "OK",
+      2000
+    );
 
-  Serial.println();
+  if (
+    !modem
+  )
+  {
+    gsmOK = false;
+
+    sendPacket(
+      MSG_GSM_STATUS,
+      "MODEM_ERROR"
+    );
+
+    return;
+  }
 
   simCommand(
     "AT+CPIN?",
@@ -815,15 +1029,11 @@ void gsmStatus()
     3000
   );
 
-  Serial.println();
-
   simCommand(
     "AT+CSQ",
     "OK",
     3000
   );
-
-  Serial.println();
 
   simCommand(
     "AT+CREG?",
@@ -831,8 +1041,9 @@ void gsmStatus()
     3000
   );
 
-  Serial.println(
-    "================================"
+  sendPacket(
+    MSG_GSM_STATUS,
+    "MODEM_OK"
   );
 }
 
@@ -850,6 +1061,11 @@ bool connectGSM()
       "[GSM] APN not configured"
     );
 
+    sendPacket(
+      MSG_GSM_FAILED,
+      "APN_NOT_SET"
+    );
+
     return false;
   }
 
@@ -865,8 +1081,11 @@ bool connectGSM()
     )
   )
   {
-    Serial.println(
-      "[GSM] No SIM800L response"
+    gsmOK = false;
+
+    sendPacket(
+      MSG_GSM_FAILED,
+      "MODEM_ERROR"
     );
 
     return false;
@@ -897,8 +1116,11 @@ bool connectGSM()
     )
   )
   {
-    Serial.println(
-      "[GSM] APN failed"
+    gsmOK = false;
+
+    sendPacket(
+      MSG_GSM_FAILED,
+      "APN_FAILED"
     );
 
     return false;
@@ -912,8 +1134,11 @@ bool connectGSM()
     )
   )
   {
-    Serial.println(
-      "[GSM] GPRS failed"
+    gsmOK = false;
+
+    sendPacket(
+      MSG_GSM_FAILED,
+      "GPRS_FAILED"
     );
 
     return false;
@@ -922,13 +1147,14 @@ bool connectGSM()
   gsmOK = true;
 
   activeNetwork =
-    NET_GSM;
+    NETWORK_GSM;
 
   Serial.println(
     "[GSM] GPRS CONNECTED"
   );
 
-  sendESPNow(
+  sendPacket(
+    MSG_GSM_CONNECTED,
     "GSM_CONNECTED"
   );
 
@@ -949,7 +1175,7 @@ void networkManager()
     wifiOK = true;
 
     activeNetwork =
-      NET_WIFI;
+      NETWORK_WIFI;
 
     return;
   }
@@ -961,7 +1187,7 @@ void networkManager()
   )
   {
     activeNetwork =
-      NET_GSM;
+      NETWORK_GSM;
 
     return;
   }
@@ -987,7 +1213,76 @@ void networkManager()
 }
 
 // ============================================================
-// STATUS
+// STATUS PACKET
+// ============================================================
+
+String networkName()
+{
+  if (
+    activeNetwork ==
+    NETWORK_WIFI
+  )
+  {
+    return "WIFI";
+  }
+
+  if (
+    activeNetwork ==
+    NETWORK_GSM
+  )
+  {
+    return "GSM";
+  }
+
+  return "NONE";
+}
+
+void sendNetworkStatus()
+{
+  String data =
+    "WIFI=" +
+    String(
+      wifiOK ? "1" : "0"
+    ) +
+    ",GSM=" +
+    String(
+      gsmOK ? "1" : "0"
+    ) +
+    ",ACTIVE=" +
+    networkName();
+
+  sendPacket(
+    MSG_NETWORK_STATUS,
+    data
+  );
+}
+
+void sendStatusPacket()
+{
+  String data =
+    "WIFI=" +
+    String(
+      wifiOK ? "1" : "0"
+    ) +
+    ",GSM=" +
+    String(
+      gsmOK ? "1" : "0"
+    ) +
+    ",MIC=" +
+    String(
+      microphoneOK ? "1" : "0"
+    ) +
+    ",NET=" +
+    networkName();
+
+  sendPacket(
+    MSG_STATUS_RESPONSE,
+    data
+  );
+}
+
+// ============================================================
+// SERIAL STATUS
 // ============================================================
 
 void printStatus()
@@ -1018,7 +1313,7 @@ void printStatus()
   );
 
   Serial.print(
-    "MIC: "
+    "Microphone: "
   );
 
   Serial.println(
@@ -1028,7 +1323,25 @@ void printStatus()
   );
 
   Serial.print(
-    "APN: "
+    "Active network: "
+  );
+
+  Serial.println(
+    networkName()
+  );
+
+  Serial.print(
+    "Wi-Fi SSID: "
+  );
+
+  Serial.println(
+    wifiSSID.length()
+      ? wifiSSID
+      : "NOT SET"
+  );
+
+  Serial.print(
+    "GSM APN: "
   );
 
   Serial.println(
@@ -1037,46 +1350,13 @@ void printStatus()
       : "NOT SET"
   );
 
-  Serial.print(
-    "ACTIVE NETWORK: "
-  );
-
-  if (
-    activeNetwork ==
-    NET_WIFI
-  )
-  {
-    Serial.println(
-      "WIFI"
-    );
-  }
-  else if (
-    activeNetwork ==
-    NET_GSM
-  )
-  {
-    Serial.println(
-      "GSM"
-    );
-  }
-  else
-  {
-    Serial.println(
-      "NONE"
-    );
-  }
-
   Serial.println(
     "================================="
-  );
-
-  sendESPNow(
-    "C3_STATUS"
   );
 }
 
 // ============================================================
-// COMMAND PROCESSOR
+// SERIAL COMMANDS
 // ============================================================
 
 void processCommand(
@@ -1096,7 +1376,7 @@ void processCommand(
   {
     Serial.println();
     Serial.println(
-      "MINICLAW C3 COMMANDS"
+      "MINICLAW C3 COMMANDS:"
     );
 
     Serial.println(
@@ -1105,6 +1385,14 @@ void processCommand(
 
     Serial.println(
       "WIFI SCAN"
+    );
+
+    Serial.println(
+      "WIFI SSID <name>"
+    );
+
+    Serial.println(
+      "WIFI PASSWORD <password>"
     );
 
     Serial.println(
@@ -1161,6 +1449,50 @@ void processCommand(
   }
 
   if (
+    upper.startsWith(
+      "WIFI SSID "
+    )
+  )
+  {
+    wifiSSID =
+      command.substring(
+        10
+      );
+
+    wifiSSID.trim();
+
+    Serial.print(
+      "[WIFI] SSID = "
+    );
+
+    Serial.println(
+      wifiSSID
+    );
+
+    return;
+  }
+
+  if (
+    upper.startsWith(
+      "WIFI PASSWORD "
+    )
+  )
+  {
+    wifiPassword =
+      command.substring(
+        14
+      );
+
+    wifiPassword.trim();
+
+    Serial.println(
+      "[WIFI] Password stored in memory."
+    );
+
+    return;
+  }
+
+  if (
     upper == "WIFI CONNECT"
   )
   {
@@ -1199,262 +1531,4 @@ void processCommand(
       gsmAPN
     );
 
-    return;
-  }
-
-  if (
-    upper == "GSM CONNECT"
-  )
-  {
-    connectGSM();
-
-    return;
-  }
-
-  if (
-    upper == "NETWORK"
-  )
-  {
-    networkManager();
-
-    printStatus();
-
-    return;
-  }
-
-  if (
-    upper == "MIC"
-  )
-  {
-    printMicrophone();
-
-    return;
-  }
-
-  if (
-    upper == "SAVE"
-  )
-  {
-    saveConfiguration();
-
-    return;
-  }
-
-  if (
-    upper == "RESET"
-  )
-  {
-    Serial.println(
-      "[SYSTEM] Restarting..."
-    );
-
-    delay(500);
-
-    ESP.restart();
-
-    return;
-  }
-
-  Serial.println(
-    "Unknown command. Type HELP."
-  );
-}
-
-// ============================================================
-// SETUP
-// ============================================================
-
-void setup()
-{
-  Serial.begin(
-    115200
-  );
-
-  delay(1500);
-
-  Serial.println();
-  Serial.println(
-    "=========================================="
-  );
-
-  Serial.println(
-    "       MINICLAW ESP32-C3 NETWORK"
-  );
-
-  Serial.println(
-    "       ESP-NOW + WIFI + GSM + MIC"
-  );
-
-  Serial.println(
-    "=========================================="
-  );
-
-  // Configuration
-
-  loadConfiguration();
-
-  // SIM800L
-
-  SIM800.begin(
-    SIM800_BAUD,
-    SERIAL_8N1,
-    SIM800_RX,
-    SIM800_TX
-  );
-
-  delay(1000);
-
-  // Microphone
-
-  microphoneOK =
-    initMicrophone();
-
-  // ESP-NOW
-
-  initESPNow();
-
-  // Wi-Fi
-
-  WiFi.mode(
-    WIFI_STA
-  );
-
-  // Automatic Wi-Fi
-
-  if (
-    wifiSSID.length() > 0
-  )
-  {
-    connectWiFi();
-  }
-
-  // GSM fallback
-
-  if (
-    !wifiOK &&
-    gsmAPN.length() > 0
-  )
-  {
-    connectGSM();
-  }
-
-  printStatus();
-
-  Serial.println();
-  Serial.println(
-    "C3 NETWORK + MICROPHONE READY"
-  );
-
-  Serial.println(
-    "Type HELP"
-  );
-}
-
-// ============================================================
-// LOOP
-// ============================================================
-
-void loop()
-{
-  // Serial Monitor
-
-  if (
-    Serial.available()
-  )
-  {
-    String command =
-      Serial.readStringUntil(
-        '\n'
-      );
-
-    processCommand(
-      command
-    );
-  }
-
-  // SIM800L output
-
-  while (
-    SIM800.available()
-  )
-  {
-    Serial.write(
-      SIM800.read()
-    );
-  }
-
-  // Network manager
-
-  if (
-    millis() -
-    lastNetworkCheck >=
-    10000
-  )
-  {
-    lastNetworkCheck =
-      millis();
-
-    networkManager();
-  }
-
-  // Microphone monitoring
-
-  if (
-    millis() -
-    lastMicPrint >=
-    3000
-  )
-  {
-    lastMicPrint =
-      millis();
-
-    if (
-      microphoneOK
-    )
-    {
-      float rms =
-        readMicrophone();
-
-      Serial.print(
-        "[MIC] RMS = "
-      );
-
-      Serial.println(
-        rms,
-        0
-      );
-    }
-  }
-
-  // Periodic C3 status
-
-  if (
-    millis() -
-    lastStatusSend >=
-    15000
-  )
-  {
-    lastStatusSend =
-      millis();
-
-    String status =
-      "C3 WIFI=" +
-      String(
-        wifiOK ? "1" : "0"
-      ) +
-      " GSM=" +
-      String(
-        gsmOK ? "1" : "0"
-      ) +
-      " MIC=" +
-      String(
-        microphoneOK ? "1" : "0"
-      );
-
-    sendESPNow(
-      status
-    );
-  }
-
-  delay(5);
-}
+    re
