@@ -1,1031 +1,561 @@
-// ============================================================
-// MINICLAW ESP32-C3 NETWORK
-// CONTINUATION — ESP-NOW + WIFI + GSM + MIC
-// ============================================================
-
-#include <WiFi.h>
-#include <esp_now.h>
-
-// ------------------------------------------------------------
-// ESP-NOW
-// ------------------------------------------------------------
-
-#define ESPNOW_CHANNEL 6
-
-// Replace with ESP32-S3 MAC later.
-// Broadcast is useful during initial testing.
-uint8_t S3_MAC[] = {
-  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
-};
-
-uint32_t packetSequence = 0;
-
-// ------------------------------------------------------------
-// PACKET TYPES
-// ------------------------------------------------------------
-
-#define PACKET_MAGIC       0x4D434C57
-#define MAX_PACKET_DATA    180
-
-#define CMD_PING            1
-#define CMD_PONG            2
-#define CMD_C3_STATUS       3
-
-#define CMD_WIFI_SCAN      10
-#define CMD_WIFI_SCAN_RESULT 11
-#define CMD_WIFI_CONNECT   12
-#define CMD_WIFI_RESULT    13
-#define CMD_WIFI_STATUS    14
-#define CMD_WIFI_DISCONNECT 15
-
-#define CMD_GSM_STATUS     20
-#define CMD_MIC_STATUS     21
-#define CMD_NETWORK_STATUS 22
-
-#define CMD_TEXT            30
-
-// ------------------------------------------------------------
-// PACKET STRUCTURE
-// ------------------------------------------------------------
-
-typedef struct
-{
-  uint32_t magic;
-  uint16_t type;
-  uint16_t source;
-  uint32_t sequence;
-  uint16_t length;
-  char data[MAX_PACKET_DATA];
-
-} MiniClawPacket;
-
-#define DEVICE_C3  3
-#define DEVICE_S3  1
-
-// ------------------------------------------------------------
-// DEVICE STATUS
-// ------------------------------------------------------------
-
-bool espNowOK = false;
-
-bool wifiConnected = false;
-bool gsmAvailable = false;
-bool microphoneAvailable = false;
-
-String wifiSSID = "";
-String wifiIP = "";
-
-// ------------------------------------------------------------
-// ESP-NOW SEND
-// ------------------------------------------------------------
-
-bool sendPacket(
-  uint16_t type,
-  const String &message
-)
-{
-  MiniClawPacket packet;
-
-  memset(
-    &packet,
-    0,
-    sizeof(packet)
-  );
-
-  packet.magic = PACKET_MAGIC;
-  packet.type = type;
-  packet.source = DEVICE_C3;
-  packet.sequence = packetSequence++;
-
-  packet.length =
-    min(
-      (int)message.length(),
-      MAX_PACKET_DATA - 1
-    );
-
-  memcpy(
-    packet.data,
-    message.c_str(),
-    packet.length
-  );
-
-  packet.data[
-    packet.length
-  ] = '\0';
-
-  esp_err_t result =
-    esp_now_send(
-      S3_MAC,
-      (uint8_t *)&packet,
-      sizeof(packet)
-    );
-
-  return result == ESP_OK;
-}
-
-// ------------------------------------------------------------
-// ESP-NOW RECEIVE
-// ------------------------------------------------------------
-
-void onDataReceive(
-  const esp_now_recv_info_t *info,
-  const uint8_t *data,
-  int len
-)
-{
-  if (
-    len != sizeof(MiniClawPacket)
-  )
-  {
-    Serial.println(
-      "[ESP-NOW] Invalid packet size"
-    );
-
-    return;
-  }
-
-  MiniClawPacket packet;
-
-  memcpy(
-    &packet,
-    data,
-    sizeof(packet)
-  );
-
-  if (
-    packet.magic != PACKET_MAGIC
-  )
-  {
-    Serial.println(
-      "[ESP-NOW] Invalid packet"
-    );
-
-    return;
-  }
-
-  String message =
-    String(packet.data);
-
-  Serial.print(
-    "[ESP-NOW RX] CMD="
-  );
-
-  Serial.print(
-    packet.type
-  );
-
-  Serial.print(
-    " DATA="
-  );
-
-  Serial.println(
-    message
-  );
-
-  // ----------------------------------------------------------
-  // PING
-  // ----------------------------------------------------------
-
-  if (
-    packet.type == CMD_PING
-  )
-  {
-    sendPacket(
-      CMD_PONG,
-      "C3:PONG"
-    );
-
-    return;
-  }
-
-  // ----------------------------------------------------------
-  // WIFI SCAN
-  // ----------------------------------------------------------
-
-  if (
-    packet.type == CMD_WIFI_SCAN
-  )
-  {
-    scanWiFi();
-
-    return;
-  }
-
-  // ----------------------------------------------------------
-  // WIFI CONNECT
-  // ----------------------------------------------------------
-
-  if (
-    packet.type == CMD_WIFI_CONNECT
-  )
-  {
-    int separator =
-      message.indexOf('|');
-
-    if (
-      separator > 0
-    )
-    {
-      String ssid =
-        message.substring(
-          0,
-          separator
-        );
-
-      String password =
-        message.substring(
-          separator + 1
-        );
-
-      connectWiFi(
-        ssid,
-        password
-      );
-    }
-
-    return;
-  }
-
-  // ----------------------------------------------------------
-  // WIFI STATUS
-  // ----------------------------------------------------------
-
-  if (
-    packet.type == CMD_WIFI_STATUS
-  )
-  {
-    sendWiFiStatus();
-
-    return;
-  }
-
-  // ----------------------------------------------------------
-  // WIFI DISCONNECT
-  // ----------------------------------------------------------
-
-  if (
-    packet.type == CMD_WIFI_DISCONNECT
-  )
-  {
-    WiFi.disconnect();
-
-    wifiConnected = false;
-
-    sendPacket(
-      CMD_WIFI_RESULT,
-      "DISCONNECTED"
-    );
-
-    return;
-  }
-
-  // ----------------------------------------------------------
-  // GSM STATUS
-  // ----------------------------------------------------------
-
-  if (
-    packet.type == CMD_GSM_STATUS
-  )
-  {
-    sendGSMStatus();
-
-    return;
-  }
-
-  // ----------------------------------------------------------
-  // MIC STATUS
-  // ----------------------------------------------------------
-
-  if (
-    packet.type == CMD_MIC_STATUS
-  )
-  {
-    sendMicStatus();
-
-    return;
-  }
-}
+/*
+  ============================================================
+                 MINICLAW ESP32-C3 AUDIO
+              REAL PWM AUDIO OUTPUT TEST
+  ============================================================
+
+  ESP32-C3
+       |
+       | GPIO 10
+       v
+  Homemade transistor amplifier
+       |
+       v
+     Speaker
+
+  RESERVED:
+      GPIO 3
+      GPIO 4
+      GPIO 5
+      GPIO 6
+      GPIO 7
+
+  AUDIO:
+      GPIO 10 = PWM audio output
+
+  PWM carrier:
+      312.5 kHz
+
+  Audio sample rate:
+      16 kHz
+
+  Audio:
+      8-bit unsigned PCM
+
+  ============================================================
+*/
+
+#include <Arduino.h>
+#include "esp_timer.h"
 
 // ============================================================
-// WIFI SCANNER
+// PIN
 // ============================================================
 
-void scanWiFi()
-{
-  Serial.println();
-  Serial.println(
-    "[WIFI] Scanning..."
-  );
+#define AUDIO_PIN 10
 
-  int count =
-    WiFi.scanNetworks();
+// ============================================================
+// PWM
+// ============================================================
 
-  if (
-    count <= 0
-  )
-  {
-    Serial.println(
-      "[WIFI] No networks found"
-    );
+#define PWM_CHANNEL 0
+#define PWM_FREQUENCY 312500
+#define PWM_RESOLUTION 8
 
-    sendPacket(
-      CMD_WIFI_SCAN_RESULT,
-      "NO_NETWORKS"
+// ============================================================
+// AUDIO
+// ============================================================
+
+#define SAMPLE_RATE 16000
+
+volatile uint8_t audioSample = 128;
+
+volatile bool audioRunning = false;
+
+esp_timer_handle_t audioTimer;
+
+
+// ============================================================
+// AUDIO SAMPLE TIMER
+// ============================================================
+
+void audioSampleTimer(
+  void* arg
+) {
+
+  if (!audioRunning) {
+
+    ledcWrite(
+      PWM_CHANNEL,
+      128
     );
 
     return;
   }
 
-  Serial.print(
-    "[WIFI] Found "
-  );
+  /*
+     Send current PCM sample
+     to PWM duty cycle.
+  */
 
-  Serial.print(
-    count
-  );
-
-  Serial.println(
-    " networks"
-  );
-
-  for (
-    int i = 0;
-    i < count;
-    i++
-  )
-  {
-    String result =
-      String(i + 1) +
-      "|" +
-      WiFi.SSID(i) +
-      "|" +
-      String(
-        WiFi.RSSI(i)
-      );
-
-    Serial.println(
-      result
-    );
-
-    sendPacket(
-      CMD_WIFI_SCAN_RESULT,
-      result
-    );
-
-    delay(30);
-  }
-
-  WiFi.scanDelete();
-
-  sendPacket(
-    CMD_WIFI_SCAN_RESULT,
-    "SCAN_COMPLETE"
+  ledcWrite(
+    PWM_CHANNEL,
+    audioSample
   );
 }
 
+
 // ============================================================
-// WIFI CONNECT
+// SET AUDIO SAMPLE
 // ============================================================
 
-void connectWiFi(
-  String ssid,
-  String password
-)
-{
-  Serial.println();
-  Serial.print(
-    "[WIFI] Connecting to "
-  );
+void setSample(
+  uint8_t sample
+) {
 
-  Serial.println(
-    ssid
-  );
-
-  WiFi.disconnect();
-
-  delay(200);
-
-  WiFi.mode(
-    WIFI_STA
-  );
-
-  WiFi.begin(
-    ssid.c_str(),
-    password.c_str()
-  );
-
-  unsigned long start =
-    millis();
-
-  while (
-    WiFi.status() != WL_CONNECTED &&
-    millis() - start < 20000
-  )
-  {
-    delay(500);
-
-    Serial.print(".");
-  }
-
-  Serial.println();
-
-  if (
-    WiFi.status() == WL_CONNECTED
-  )
-  {
-    wifiConnected = true;
-
-    wifiSSID =
-      WiFi.SSID();
-
-    wifiIP =
-      WiFi.localIP().toString();
-
-    Serial.println(
-      "[WIFI] CONNECTED"
-    );
-
-    Serial.print(
-      "[WIFI] IP: "
-    );
-
-    Serial.println(
-      wifiIP
-    );
-
-    sendPacket(
-      CMD_WIFI_RESULT,
-      "CONNECTED|" +
-      wifiSSID +
-      "|" +
-      wifiIP
-    );
-  }
-  else
-  {
-    wifiConnected = false;
-
-    Serial.println(
-      "[WIFI] CONNECTION FAILED"
-    );
-
-    sendPacket(
-      CMD_WIFI_RESULT,
-      "FAILED"
-    );
-  }
+  audioSample =
+    sample;
 }
 
-// ============================================================
-// WIFI STATUS
-// ============================================================
-
-void sendWiFiStatus()
-{
-  if (
-    WiFi.status() ==
-    WL_CONNECTED
-  )
-  {
-    wifiConnected = true;
-
-    String result =
-      "CONNECTED|" +
-      WiFi.SSID() +
-      "|" +
-      WiFi.localIP().toString();
-
-    sendPacket(
-      CMD_WIFI_STATUS,
-      result
-    );
-  }
-  else
-  {
-    wifiConnected = false;
-
-    sendPacket(
-      CMD_WIFI_STATUS,
-      "DISCONNECTED"
-    );
-  }
-}
 
 // ============================================================
-// GSM STATUS
+// START AUDIO TIMER
 // ============================================================
 
-void sendGSMStatus()
-{
-  if (
-    gsmAvailable
-  )
-  {
-    sendPacket(
-      CMD_GSM_STATUS,
-      "AVAILABLE"
-    );
-  }
-  else
-  {
-    sendPacket(
-      CMD_GSM_STATUS,
-      "NOT_AVAILABLE"
-    );
-  }
-}
+void startAudioTimer() {
 
-// ============================================================
-// MICROPHONE STATUS
-// ============================================================
+  const esp_timer_create_args_t timerArgs = {
 
-void sendMicStatus()
-{
-  if (
-    microphoneAvailable
-  )
-  {
-    sendPacket(
-      CMD_MIC_STATUS,
-      "AVAILABLE"
-    );
-  }
-  else
-  {
-    sendPacket(
-      CMD_MIC_STATUS,
-      "NOT_AVAILABLE"
-    );
-  }
-}
+    .callback =
+      &audioSampleTimer,
 
-// ============================================================
-// NETWORK STATUS
-// ============================================================
+    .arg =
+      NULL,
 
-void sendNetworkStatus()
-{
-  String result;
+    .dispatch_method =
+      ESP_TIMER_TASK,
 
-  if (
-    wifiConnected
-  )
-  {
-    result =
-      "WIFI|" +
-      WiFi.SSID() +
-      "|" +
-      WiFi.localIP().toString();
-  }
-  else if (
-    gsmAvailable
-  )
-  {
-    result =
-      "GSM";
-  }
-  else
-  {
-    result =
-      "OFFLINE";
-  }
+    .name =
+      "audio_sample"
 
-  sendPacket(
-    CMD_NETWORK_STATUS,
-    result
+  };
+
+
+  esp_timer_create(
+    &timerArgs,
+    &audioTimer
+  );
+
+
+  /*
+     1,000,000 microseconds / 16,000
+     = 62.5 microseconds/sample
+  */
+
+  esp_timer_start_periodic(
+    audioTimer,
+    62
   );
 }
 
+
 // ============================================================
-// ESP-NOW INITIALIZATION
+// SILENCE
 // ============================================================
 
-bool initESPNow()
-{
-  Serial.println(
-    "[ESP-NOW] Starting..."
-  );
+void silence() {
 
-  WiFi.mode(
-    WIFI_STA
-  );
-
-  WiFi.disconnect();
-
-  if (
-    esp_now_init() != ESP_OK
-  )
-  {
-    Serial.println(
-      "[ESP-NOW] Initialization failed"
-    );
-
-    return false;
-  }
-
-  esp_now_register_recv_cb(
-    onDataReceive
-  );
-
-  esp_now_peer_info_t peer;
-
-  memset(
-    &peer,
-    0,
-    sizeof(peer)
-  );
-
-  memcpy(
-    peer.peer_addr,
-    S3_MAC,
-    6
-  );
-
-  peer.channel =
-    ESPNOW_CHANNEL;
-
-  peer.encrypt =
+  audioRunning =
     false;
 
-  if (
-    esp_now_is_peer_exist(
-      S3_MAC
-    )
-  )
-  {
-    esp_now_del_peer(
-      S3_MAC
+  audioSample =
+    128;
+
+  ledcWrite(
+    PWM_CHANNEL,
+    128
+  );
+}
+
+
+// ============================================================
+// SINE WAVE
+// ============================================================
+
+void playTone(
+  float frequency,
+  uint32_t duration
+) {
+
+  const uint32_t samplesPerCycle =
+    SAMPLE_RATE / frequency;
+
+  uint32_t totalSamples =
+    ((uint64_t)duration *
+     SAMPLE_RATE) /
+    1000;
+
+
+  audioRunning =
+    true;
+
+
+  for (
+    uint32_t i = 0;
+    i < totalSamples;
+    i++
+  ) {
+
+    float phase =
+      (float)(i % samplesPerCycle) /
+      samplesPerCycle;
+
+    float value =
+      sin(
+        phase *
+        2.0 *
+        PI
+      );
+
+
+    /*
+       Convert -1...+1
+       into 0...255
+    */
+
+    uint8_t sample =
+      (uint8_t)(
+        128 +
+        value * 110
+      );
+
+
+    setSample(
+      sample
+    );
+
+
+    delayMicroseconds(
+      1000000 /
+      SAMPLE_RATE
     );
   }
 
-  if (
-    esp_now_add_peer(
-      &peer
-    ) != ESP_OK
-  )
-  {
-    Serial.println(
-      "[ESP-NOW] Peer failed"
-    );
 
-    return false;
-  }
+  silence();
+}
 
-  espNowOK = true;
+
+// ============================================================
+// FREQUENCY SWEEP
+// ============================================================
+
+void frequencySweep() {
 
   Serial.println(
-    "[ESP-NOW] READY"
+    "Frequency sweep..."
   );
 
-  return true;
+
+  audioRunning =
+    true;
+
+
+  for (
+    float frequency = 100;
+    frequency <= 5000;
+    frequency += 20
+  ) {
+
+    uint32_t samples =
+      SAMPLE_RATE / frequency;
+
+
+    if (samples < 2)
+      samples = 2;
+
+
+    for (
+      uint32_t i = 0;
+      i < samples;
+      i++
+    ) {
+
+      float phase =
+        (float)i /
+        samples;
+
+
+      float value =
+        sin(
+          phase *
+          2.0 *
+          PI
+        );
+
+
+      audioSample =
+        128 +
+        value * 110;
+
+
+      delayMicroseconds(
+        1000000 /
+        SAMPLE_RATE
+      );
+    }
+  }
+
+
+  silence();
 }
+
+
+// ============================================================
+// STARTUP SOUND
+// ============================================================
+
+void startupSound() {
+
+  playTone(
+    440,
+    300
+  );
+
+  delay(80);
+
+  playTone(
+    660,
+    300
+  );
+
+  delay(80);
+
+  playTone(
+    880,
+    500
+  );
+}
+
+
+// ============================================================
+// AMPLIFIER TEST
+// ============================================================
+
+void amplifierTest() {
+
+  Serial.println();
+
+  Serial.println(
+    "=============================="
+  );
+
+  Serial.println(
+    "AMPLIFIER TEST"
+  );
+
+  Serial.println(
+    "440 Hz"
+  );
+
+  Serial.println(
+    "=============================="
+  );
+
+
+  playTone(
+    440,
+    2000
+  );
+
+
+  delay(500);
+
+
+  Serial.println(
+    "880 Hz"
+  );
+
+
+  playTone(
+    880,
+    2000
+  );
+
+
+  delay(500);
+
+
+  Serial.println(
+    "Test finished."
+  );
+}
+
 
 // ============================================================
 // SERIAL COMMANDS
 // ============================================================
 
-void printHelp()
-{
-  Serial.println();
-  Serial.println(
-    "========== MINICLAW C3 =========="
-  );
-
-  Serial.println(
-    "PING"
-  );
-
-  Serial.println(
-    "SCAN"
-  );
-
-  Serial.println(
-    "CONNECT <ssid>|<password>"
-  );
-
-  Serial.println(
-    "WIFI STATUS"
-  );
-
-  Serial.println(
-    "WIFI OFF"
-  );
-
-  Serial.println(
-    "GSM STATUS"
-  );
-
-  Serial.println(
-    "MIC STATUS"
-  );
-
-  Serial.println(
-    "NETWORK STATUS"
-  );
-
-  Serial.println(
-    "STATUS"
-  );
-
-  Serial.println(
-    "MAC"
-  );
-
-  Serial.println(
-    "HELP"
-  );
-
-  Serial.println(
-    "================================="
-  );
-
-  Serial.println();
-}
-
-// ============================================================
-// SERIAL COMMAND PROCESSOR
-// ============================================================
-
-void processSerialCommand(
+void processCommand(
   String command
-)
-{
+) {
+
   command.trim();
 
-  String upper =
-    command;
+  command.toUpperCase();
 
-  upper.toUpperCase();
-
-  // ----------------------------------------------------------
-  // HELP
-  // ----------------------------------------------------------
 
   if (
-    upper == "HELP"
-  )
-  {
-    printHelp();
+    command ==
+    "TEST"
+  ) {
+
+    amplifierTest();
 
     return;
   }
 
-  // ----------------------------------------------------------
-  // PING
-  // ----------------------------------------------------------
 
   if (
-    upper == "PING"
-  )
-  {
-    if (
-      sendPacket(
-        CMD_PING,
-        "C3:PING"
-      )
-    )
-    {
-      Serial.println(
-        "[ESP-NOW] PING sent"
-      );
-    }
-    else
-    {
-      Serial.println(
-        "[ESP-NOW] PING failed"
-      );
-    }
+    command ==
+    "440"
+  ) {
 
-    return;
-  }
-
-  // ----------------------------------------------------------
-  // SCAN
-  // ----------------------------------------------------------
-
-  if (
-    upper == "SCAN"
-  )
-  {
-    scanWiFi();
-
-    return;
-  }
-
-  // ----------------------------------------------------------
-  // CONNECT
-  // ----------------------------------------------------------
-
-  if (
-    upper.startsWith(
-      "CONNECT "
-    )
-  )
-  {
-    String credentials =
-      command.substring(8);
-
-    int separator =
-      credentials.indexOf('|');
-
-    if (
-      separator < 1
-    )
-    {
-      Serial.println(
-        "Use: CONNECT SSID|PASSWORD"
-      );
-
-      return;
-    }
-
-    String ssid =
-      credentials.substring(
-        0,
-        separator
-      );
-
-    String password =
-      credentials.substring(
-        separator + 1
-      );
-
-    connectWiFi(
-      ssid,
-      password
+    playTone(
+      440,
+      2000
     );
 
     return;
   }
 
-  // ----------------------------------------------------------
-  // WIFI STATUS
-  // ----------------------------------------------------------
 
   if (
-    upper == "WIFI STATUS"
-  )
-  {
-    sendWiFiStatus();
+    command ==
+    "880"
+  ) {
+
+    playTone(
+      880,
+      2000
+    );
 
     return;
   }
 
-  // ----------------------------------------------------------
-  // WIFI OFF
-  // ----------------------------------------------------------
 
   if (
-    upper == "WIFI OFF"
-  )
-  {
-    WiFi.disconnect();
+    command ==
+    "SWEEP"
+  ) {
 
-    wifiConnected = false;
+    frequencySweep();
+
+    return;
+  }
+
+
+  if (
+    command ==
+    "STOP"
+  ) {
+
+    silence();
 
     Serial.println(
-      "[WIFI] Disconnected"
+      "Audio stopped."
     );
 
     return;
   }
 
-  // ----------------------------------------------------------
-  // GSM STATUS
-  // ----------------------------------------------------------
 
   if (
-    upper == "GSM STATUS"
-  )
-  {
-    sendGSMStatus();
+    command ==
+    "STATUS"
+  ) {
 
-    return;
-  }
-
-  // ----------------------------------------------------------
-  // MIC STATUS
-  // ----------------------------------------------------------
-
-  if (
-    upper == "MIC STATUS"
-  )
-  {
-    sendMicStatus();
-
-    return;
-  }
-
-  // ----------------------------------------------------------
-  // NETWORK STATUS
-  // ----------------------------------------------------------
-
-  if (
-    upper == "NETWORK STATUS"
-  )
-  {
-    sendNetworkStatus();
-
-    return;
-  }
-
-  // ----------------------------------------------------------
-  // MAC ADDRESS
-  // ----------------------------------------------------------
-
-  if (
-    upper == "MAC"
-  )
-  {
-    Serial.print(
-      "[C3 MAC] "
-    );
-
-    Serial.println(
-      WiFi.macAddress()
-    );
-
-    return;
-  }
-
-  // ----------------------------------------------------------
-  // STATUS
-  // ----------------------------------------------------------
-
-  if (
-    upper == "STATUS"
-  )
-  {
     Serial.println();
-    Serial.println(
-      "========== C3 STATUS =========="
-    );
 
-    Serial.print(
-      "ESP-NOW: "
+    Serial.println(
+      "MiniClaw C3 Audio"
     );
 
     Serial.println(
-      espNowOK
-        ? "OK"
-        : "ERROR"
-    );
-
-    Serial.print(
-      "WiFi: "
+      "Output GPIO: 10"
     );
 
     Serial.println(
-      wifiConnected
-        ? "CONNECTED"
-        : "DISCONNECTED"
-    );
-
-    Serial.print(
-      "GSM: "
+      "PWM carrier: 312.5 kHz"
     );
 
     Serial.println(
-      gsmAvailable
-        ? "AVAILABLE"
-        : "NOT AVAILABLE"
-    );
-
-    Serial.print(
-      "MIC: "
+      "Audio rate: 16 kHz"
     );
 
     Serial.println(
-      microphoneAvailable
-        ? "AVAILABLE"
-        : "NOT AVAILABLE"
-    );
-
-    Serial.println(
-      "================================"
+      "Resolution: 8-bit"
     );
 
     return;
   }
+
+
+  if (
+    command ==
+    "HELP"
+  ) {
+
+    Serial.println();
+
+    Serial.println(
+      "MiniClaw C3 commands:"
+    );
+
+    Serial.println(
+      "TEST   - amplifier test"
+    );
+
+    Serial.println(
+      "440    - 440 Hz tone"
+    );
+
+    Serial.println(
+      "880    - 880 Hz tone"
+    );
+
+    Serial.println(
+      "SWEEP  - frequency sweep"
+    );
+
+    Serial.println(
+      "STOP   - stop audio"
+    );
+
+    Serial.println(
+      "STATUS - show audio settings"
+    );
+
+    Serial.println(
+      "HELP   - show commands"
+    );
+
+    return;
+  }
+
 
   Serial.println(
-    "Unknown command. Type HELP."
+    "Unknown command."
   );
 }
+
 
 // ============================================================
 // SETUP
 // ============================================================
 
-void setup()
-{
+void setup() {
+
   Serial.begin(
     115200
   );
 
-  delay(1500);
+
+  delay(1000);
+
 
   Serial.println();
+
   Serial.println(
     "======================================"
   );
@@ -1035,131 +565,103 @@ void setup()
   );
 
   Serial.println(
-    "       NETWORK CONTROLLER"
+    "       PWM AUDIO CONTROLLER"
   );
 
   Serial.println(
     "======================================"
   );
 
-  // ----------------------------------------------------------
-  // WIFI
-  // ----------------------------------------------------------
 
-  WiFi.mode(
-    WIFI_STA
+  /*
+     Configure high-frequency PWM.
+  */
+
+  ledcSetup(
+    PWM_CHANNEL,
+    PWM_FREQUENCY,
+    PWM_RESOLUTION
   );
 
-  Serial.print(
-    "[C3 MAC] "
+
+  ledcAttachPin(
+    AUDIO_PIN,
+    PWM_CHANNEL
   );
 
-  Serial.println(
-    WiFi.macAddress()
+
+  /*
+     Start at the centre point.
+     This represents zero amplitude
+     for unsigned 8-bit PCM.
+  */
+
+  ledcWrite(
+    PWM_CHANNEL,
+    128
   );
 
-  // ----------------------------------------------------------
-  // ESP-NOW
-  // ----------------------------------------------------------
 
-  espNowOK =
-    initESPNow();
+  /*
+     Start sample timer.
+  */
 
-  // ----------------------------------------------------------
-  // CURRENT WIFI STATE
-  // ----------------------------------------------------------
+  startAudioTimer();
 
-  if (
-    WiFi.status() ==
-    WL_CONNECTED
-  )
-  {
-    wifiConnected = true;
-  }
-
-  // ----------------------------------------------------------
-  // INITIAL STATUS
-  // ----------------------------------------------------------
 
   Serial.println();
 
   Serial.println(
-    "[C3] System ready."
+    "GPIO 10 = PWM AUDIO"
   );
 
   Serial.println(
-    "Type HELP for commands."
+    "GPIO 3-7 untouched."
   );
 
   Serial.println();
 
-  // Send initial status to S3
-
-  sendPacket(
-    CMD_C3_STATUS,
-    "C3_READY"
+  Serial.println(
+    "MiniClaw C3 AUDIO READY."
   );
 
-  sendNetworkStatus();
+  Serial.println(
+    "Type HELP."
+  );
+
+
+  delay(500);
+
+
+  /*
+     Startup sound.
+  */
+
+  startupSound();
 }
+
 
 // ============================================================
 // LOOP
 // ============================================================
 
-void loop()
-{
-  // ----------------------------------------------------------
-  // SERIAL MONITOR
-  // ----------------------------------------------------------
+void loop() {
 
   if (
     Serial.available()
-  )
-  {
+  ) {
+
     String command =
       Serial.readStringUntil(
         '\n'
       );
 
-    processSerialCommand(
+
+    processCommand(
       command
     );
   }
 
-  // ----------------------------------------------------------
-  // WIFI STATE MONITOR
-  // ----------------------------------------------------------
 
-  bool currentWiFi =
-    WiFi.status() ==
-    WL_CONNECTED;
-
-  if (
-    currentWiFi !=
-    wifiConnected
-  )
-  {
-    wifiConnected =
-      currentWiFi;
-
-    if (
-      wifiConnected
-    )
-    {
-      Serial.println(
-        "[WIFI] Connection detected"
-      );
-    }
-    else
-    {
-      Serial.println(
-        "[WIFI] Connection lost"
-      );
-    }
-
-    sendNetworkStatus();
-  }
-
-  delay(10);
+  delay(5);
 }
